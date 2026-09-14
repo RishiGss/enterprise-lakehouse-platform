@@ -1,0 +1,245 @@
+# Compose project name, which prefixes container names, network names, and volume names
+# Ex: enterprise-lakehouse-platform-dev-postgres-1
+# name: ${variable:?error message if not set}
+name: ${AIRFLOW_PROJECT_NAME:?must be set — pass --env-file .env.dev or .env.prod}
+# if AIRFLOW_PROJECT_NAME is not set, Docker Compose will throw an error
+# AIRFLOW_PROJECT_NAME: must be set — pass --env-file .env.dev or .env.prod
+
+
+# -------------------------------------------------------------------
+# Shared config inherited by every Airflow service
+# -------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.1.8                         # Airflow Docker image:version. Pinned per version-matrix.md
+  env_file:
+    # default to .env.dev if ENV_FILE is not set.
+    # Contains AIRFLOW_UID, secrets, project name, impersonation account details and passes them as environment variables to the container
+    - ${ENV_FILE:-.env.dev}
+
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor            # single-machine, per blueprint W1
+
+    # Registers the FAB (Flask App Builder) auth manager.
+    # This is what makes username/password login and the `_AIRFLOW_WWW_USER_*` init vars work.
+    # Without it, Airflow 3 defaults to a 'Simple Auth Manager' and user creation silently has no path.
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+
+    # PostgreSQL connection used by Airflow metadata DB
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+
+    # Don't clutter the UI with Airflow's sample DAGs
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+
+    # New DAGs are paused by default when first created
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+
+    # Fernet key used to encrypt connections and variables at rest in the database
+    # This key is used by Airflow to encrypt sensitive values stored in its metadata database, such as connection passwords and Variables.
+    AIRFLOW__CORE__FERNET_KEY: '${AIRFLOW_FERNET_KEY}'
+
+    # Airflow 3: tasks call back to the API server via this URL.
+    # Must match the api-server service name below.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+
+    # Pre-shared cryptographic key used to secure internal communications and sign/validate JSON Web Tokens (JWT) for the Airflow Public API
+    AIRFLOW__API_AUTH__JWT_SECRET: '${AIRFLOW_JWT_SECRET}'
+
+    # Exposes scheduler health on :8974
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+
+    # --- GCP ---
+    GOOGLE_APPLICATION_CREDENTIALS: /home/airflow/.config/gcloud/application_default_credentials.json
+
+    # Google Cloud project ID for the environment
+    GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
+
+    # Ship task logs remotely to GCS instead of local disk
+    AIRFLOW__LOGGING__REMOTE_LOGGING: 'True'
+
+    # Airflow connection ID used for remote logging — deliberately separate from google_cloud_default.
+    # Log-writing is a platform/orchestration concern (Airflow shipping its own task logs), so it runs
+    # under airflow-orchestrator-sa, not the data-workload identity.
+    AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: 'google_cloud_logging'
+
+    # GCS bucket where Airflow logs are stored
+    AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: 'gs://${GOOGLE_CLOUD_PROJECT}-airflow-logs'
+
+    # Default Google Cloud connection for data-plane operators (BigQuery, GCS reads/writes, etc.).
+    # Impersonates dataproc-runtime-sa — the least-privilege workload identity — on top of mounted user ADC.
+    # DataprocCreateBatchOperator calls override this per-operator with impersonation_chain=airflow-orchestrator-sa,
+    # since submission requires a different identity than execution.
+    AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: >-
+      {"conn_type": "google_cloud_platform", "extra": {"project": "${GOOGLE_CLOUD_PROJECT}", "impersonation_chain": "${DATAPROC_RUNTIME_SA}"}}
+
+    # Logging-only connection. Impersonates airflow-orchestrator-sa, which holds the narrow
+    # roles/storage.objectUser grant on the airflow-logs bucket — write access only, no ACL/IAM management.
+    AIRFLOW_CONN_GOOGLE_CLOUD_LOGGING: >-
+      {"conn_type": "google_cloud_platform", "extra": {"project": "${GOOGLE_CLOUD_PROJECT}", "impersonation_chain": "${AIRFLOW_ORCHESTRATOR_SA}"}}
+
+  volumes:
+    # Mounts for Airflow container
+    # local_folder:container_folder
+    - ./dags:/opt/airflow/dags                          # Mount local DAGs into the Airflow container
+    - ./logs:/opt/airflow/logs                          # Mount local logs into the Airflow container
+    - ./plugins:/opt/airflow/plugins                    # Mount local plugins into the Airflow container
+    - ./config:/opt/airflow/config                      # Mount local config into the Airflow container
+    - ~/.config/gcloud/application_default_credentials.json:/home/airflow/.config/gcloud/application_default_credentials.json:ro  # Mount local gcloud credentials as read-only — the base identity impersonation builds on
+
+  user: "${AIRFLOW_UID:?must be set in .env.<env>}:0"   # Run container as non-root with UID from .env, defaulting to 1000
+  depends_on:
+    postgres:
+      condition: service_healthy                        # Don't start Airflow services until Postgres is actually healthy and ready
+
+x-airflow-common-depends-on: &airflow-common-depends-on
+  postgres:
+    condition: service_healthy
+
+# -------------------------------------------------------------------
+# Services
+# -------------------------------------------------------------------
+services: # Each service runs in a separate container
+
+  # ---------------------------------------------------------------
+  # PostgreSQL
+  # ---------------------------------------------------------------
+  postgres:
+    image: postgres:16                               # Airflow's metadata database # PostgreSQL database image
+    environment:
+      POSTGRES_USER: airflow                         # PostgreSQL username
+      POSTGRES_PASSWORD: airflow                     # PostgreSQL local-only credential, not exposed externally
+      POSTGRES_DB: airflow                           # PostgreSQL database name
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data  # Persist PostgreSQL data across container restarts
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # ---------------------------------------------------------------
+  # Airflow initialization
+  # ---------------------------------------------------------------
+  # One-shot: runs DB migration + admin user creation via the image's entrypoint, then exits.
+  # Runs as root so it can fix volume ownership.
+  airflow-init:
+    <<: *airflow-common                              # Inherits all common Airflow configuration above
+    entrypoint: /bin/bash                            # Use bash instead of the default Airflow entrypoint
+    command:
+      # Run the following commands in bash
+      # Create necessary directories inside the container for Airflow logs, DAGs, plugins, config; and set appropriate ownership
+      # Invoke the official Airflow entrypoint so that the database migration (_AIRFLOW_DB_MIGRATE) and admin user creation (_AIRFLOW_WWW_USER_CREATE) are executed.
+      - -c
+      - |
+        mkdir -p /opt/airflow/{logs,dags,plugins,config}
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/{logs,dags,plugins,config}
+        /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'                                        # entrypoint runs `db migrate` itself
+      _AIRFLOW_WWW_USER_CREATE: 'true'                                   # entrypoint creates the admin user
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}          # Admin username for the Airflow web UI and API
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}          # Admin password for the Airflow web UI and API
+    user: "0:0"                                                          # Run as root to allow fixing volume ownership
+
+  # ---------------------------------------------------------------
+  # Airflow API server / Web UI
+  # ---------------------------------------------------------------
+  airflow-apiserver:
+    <<: *airflow-common                              # Inherits all common Airflow configuration above
+    command: api-server                              # Start Airflow's API server
+    ports:
+      - "${AIRFLOW_UI_PORT:?must be set in .env.<env>}:8080"   # host port is env-specific # host_port:container_port
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully    # Start only after airflow-init completes successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]  # Check whether Airflow API server is healthy
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+
+  # ---------------------------------------------------------------
+  # Airflow Scheduler
+  # ---------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common                              # Inherits all common Airflow configuration above
+    command: scheduler                               # Start the Airflow scheduler - picks up DAGs, schedules task runs
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully    # Start only after airflow-init completes successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  # ---------------------------------------------------------------
+  # Airflow Triggerer
+  # ---------------------------------------------------------------
+  airflow-triggerer:
+    <<: *airflow-common                              # Inherits all common Airflow configuration above
+    command: triggerer                               # Start the Airflow triggerer - handles asynchronous task triggers and deferred tasks
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully    # Start only after airflow-init completes successfully
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  # ---------------------------------------------------------------
+  # Airflow DAG Processor
+  # ---------------------------------------------------------------
+  # Airflow 3 moved DAG parsing out of the scheduler into its own process.
+  # Without this service, DAG files are never parsed and nothing appears in the UI.
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor                           # Start the Airflow DAG processor - parses DAG files independently of the scheduler
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully    # Start only after airflow-init completes successfully
+    healthcheck:                                     # Health check for the Airflow DAG processor service
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"'] # HOSTNAME will be replaced with the container's hostname inside the container
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  # ---------------------------------------------------------------
+  # Airflow CLI
+  # ---------------------------------------------------------------
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    # Workaround for entrypoint issue. See: https://github.com/apache/airflow/issues/16252
+    command:
+      - bash
+      - -c
+      - airflow
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully    # Start only after airflow-init completes successfully
+    restart: "no"
+
+volumes:
+
+  postgres-db-volume:

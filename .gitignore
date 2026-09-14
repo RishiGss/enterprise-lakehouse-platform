@@ -1,0 +1,23 @@
+# .gitignore file
+# Below are the files and directories to be ignored by Git
+
+# environment secrets — never committed
+.env
+.env.*
+!.env.example # negate the previous rule for .env* so that the example file is not ignored
+
+# local Airflow scratch
+airflow/logs/
+airflow/config/airflow.cfg
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
