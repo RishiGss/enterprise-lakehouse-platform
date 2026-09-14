@@ -1,0 +1,44 @@
+enterprise-lakehouse-platform/
+│
+├── .github/
+│   └── workflows/
+│       └── ci.yml                    # W4 — lint, pytest, dbt build --select state:modified+
+│
+├── airflow/
+│   ├── docker-compose.yml            # single file, env-parameterized — no separate prod compose file
+│   ├── .env.dev                      # gitignored — dev project, dataproc-runtime-sa, dev buckets
+│   ├── .env.prod                     # gitignored — created W17 — prod project, prd-dataproc-runtime-sa, prod buckets
+│   ├── .env.example                  # committed — placeholder values, documents what both files need
+│   ├── dags/
+│   │   └── (placeholder DAG today)   # environment-agnostic — reads project/SA from env, never hardcodes
+│   ├── logs/                         # gitignored — local scratch before remote logging takes over
+│   ├── config/
+│   └── plugins/
+│
+├── spark_jobs/                       # empty until W2–W3
+│   ├── bronze/
+│   ├── silver/
+│   └── shared/                       # common utils, schemas, testing helpers
+│
+├── dbt/                              # empty until W7
+│   ├── models/
+│   │   ├── staging/
+│   │   ├── intermediate/
+│   │   └── marts/
+│   ├── dbt_project.yml
+│   └── packages.yml                  # dbt-utils, dbt-expectations
+│
+├── streaming/                        # empty until W9
+│   ├── kafka/
+│   │   ├── producers/
+│   │   └── consumers/
+│   └── structured_streaming/
+│
+├── tests/                            # pytest — DAG tests, Spark job unit tests
+│
+├── docs/                             # repo-local architecture notes, Mermaid diagrams
+│   └── architecture.md
+│
+├── .gitignore
+├── pyproject.toml                    # uv-managed, per your version-matrix
+└── README.md
